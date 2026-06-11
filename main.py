@@ -15,15 +15,19 @@ from handlers.admin_models import router as admin_models_router
 from handlers.clients_user import router as clients_user_router
 from handlers.admin_clients import router as admin_clients_router
 
+from app.webserver import start_web_server  # <- مهم
+
 
 async def main():
     logging.basicConfig(level=logging.INFO)
 
+    # تهيئة قاعدة البيانات (إنشاء الجداول إن لم تكن موجودة)
     await init_db()
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
 
+    # روترات البوت
     dp.include_router(start_router)
     dp.include_router(nav_router)
 
@@ -36,7 +40,12 @@ async def main():
     # قسم العملاء (واجهة المستخدم - حالياً Placeholder)
     dp.include_router(clients_user_router)
 
-    await dp.start_polling(bot)
+    # نشغّل السيرفر الصغير + البوت معاً
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    web_task = asyncio.create_task(start_web_server())
+
+    # ننتظر المهمتين معاً
+    await asyncio.gather(bot_task, web_task)
 
 
 if __name__ == "__main__":
