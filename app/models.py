@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, Boolean, Text, ForeignKey
+from sqlalchemy import String, Integer, Boolean, Text, ForeignKey, BigInteger
 
 
 class Base(DeclarativeBase):
@@ -17,7 +17,7 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tg_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
 
     # owner / staff
     role: Mapped[str] = mapped_column(String(20), default="staff")
