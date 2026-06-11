@@ -12,6 +12,8 @@ from handlers.nav import router as nav_router
 from handlers.admin_settings import router as admin_settings_router
 from handlers.admin_staff import router as admin_staff_router
 from handlers.admin_models import router as admin_models_router
+from handlers.clients_user import router as clients_user_router
+from handlers.admin_clients import router as admin_clients_router
 
 
 async def main():
@@ -24,9 +26,15 @@ async def main():
 
     dp.include_router(start_router)
     dp.include_router(nav_router)
+
+    # لوحات الإدارة
     dp.include_router(admin_settings_router)
     dp.include_router(admin_staff_router)
     dp.include_router(admin_models_router)
+    dp.include_router(admin_clients_router)
+
+    # قسم العملاء (واجهة المستخدم - حالياً Placeholder)
+    dp.include_router(clients_user_router)
 
     await dp.start_polling(bot)
 
