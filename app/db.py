@@ -1,6 +1,7 @@
 # app/db.py
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.engine import make_url
+
 from app.config import DATABASE_URL
 from app.models import Base
 
@@ -8,7 +9,7 @@ from app.models import Base
 url = make_url(DATABASE_URL)
 
 if url.get_backend_name().startswith("postgresql"):
-    # Supabase + PgBouncer → إلغاء كاش الـ prepared statements
+    # اتصال PostgreSQL (Supabase) - نعطّل كاش الـ prepared statements تحسّباً لـ PgBouncer
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
