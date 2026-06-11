@@ -9,7 +9,8 @@ from app.models import Base
 url = make_url(DATABASE_URL)
 
 if url.get_backend_name().startswith("postgresql"):
-    # اتصال PostgreSQL (Supabase) - نعطّل كاش الـ prepared statements تحسّباً لـ PgBouncer
+    # اتصال PostgreSQL (Supabase)
+    # نعطّل كاش الـ prepared statements تحسّباً لـ PgBouncer
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
