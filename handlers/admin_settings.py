@@ -13,6 +13,7 @@ def _settings_menu_kb():
     kb.button(text="👨‍💼 إدارة الموظفين", callback_data="admin_staff_menu")
     kb.button(text="🧠 إدارة الموديلات", callback_data="admin_models_menu")
     kb.button(text="🗂️ إدارة العملاء", callback_data="admin_clients_menu")
+    kb.button(text="📂 إدارة الأقسام والنماذج", callback_data="admin_sections_menu")
     kb.button(text="🏠 الرئيسية", callback_data="nav_home")
     kb.adjust(1)
     return kb.as_markup()
