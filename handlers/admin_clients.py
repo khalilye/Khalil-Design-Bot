@@ -14,7 +14,6 @@ from sqlalchemy import select
 from app.db import SessionLocal
 from app.models import Client
 from app.permissions import get_or_create_user
-from app.model_store import list_models
 from app.config import STORAGE_DIR
 
 router = Router()
@@ -50,9 +49,9 @@ def _client_actions_kb(client_id: int):
     kb.button(text="📏 تعديل المقاس", callback_data=f"admin_client_edit_size:{client_id}")
     kb.button(text="🧾 برومبت الهوية", callback_data=f"admin_client_edit_brand:{client_id}")
     kb.button(text="🧾 برومبت اللَّياوت", callback_data=f"admin_client_edit_layout:{client_id}")
-    kb.button(text="🧠 موديل النص الافتراضي", callback_data=f"admin_client_pick_model_menu:text:{client_id}")
-    kb.button(text="🖼️ موديل الصور الافتراضي", callback_data=f"admin_client_pick_model_menu:image:{client_id}")
     kb.button(text="🖼️ رفع/تغيير الكليشة (PNG)", callback_data=f"admin_client_overlay:{client_id}")
+    kb.button(text="⬆️ تحريك لأعلى", callback_data=f"admin_client_move:{client_id}:up")
+    kb.button(text="⬇️ تحريك لأسفل", callback_data=f"admin_client_move:{client_id}:down")
     kb.button(text="🗑️ حذف العميل", callback_data=f"admin_client_delete:{client_id}")
     kb.button(text="⬅️ رجوع لقائمة العملاء", callback_data="admin_clients_menu")
     kb.adjust(1)
@@ -67,8 +66,6 @@ async def _format_client_text(client: Client) -> str:
         f"الاسم: {client.name}\n"
         f"المقاس الافتراضي: {client.design_width}x{client.design_height}\n"
         f"كليشة (Overlay): {has_overlay}\n"
-        f"موديل النص الافتراضي: {client.default_text_model or 'غير محدد'}\n"
-        f"موديل الصور الافتراضي: {client.default_image_model or 'غير محدد'}\n"
         f"\n"
         f"برومبت الهوية (مختصر):\n"
         f"{(client.brand_prompt[:200] + '...') if len(client.brand_prompt) > 200 else (client.brand_prompt or 'غير محدد')}\n"
@@ -102,7 +99,9 @@ async def admin_clients_menu(c: CallbackQuery):
         return
 
     async with SessionLocal() as s:
-        res = await s.execute(select(Client).order_by(Client.name.asc()))
+        res = await s.execute(
+            select(Client).order_by(Client.sort_order.asc(), Client.name.asc())
+        )
         clients = list(res.scalars().all())
 
     text = "إدارة العملاء:\n\n"
@@ -148,21 +147,24 @@ async def admin_client_add_name(m: Message, state: FSMContext):
             await m.answer("يوجد عميل بهذا الاسم بالفعل. اختر اسماً مختلفاً.")
             return
 
+        # حساب sort_order (أكبر قيمة + 1)
+        res_order = await s.execute(select(Client.sort_order))
+        orders = [o for (o,) in res_order.all()]
+        next_order = (max(orders) + 1) if orders else 0
+
         c = Client(
             name=name,
             design_width=1080,
             design_height=1080,
+            sort_order=next_order,
         )
         s.add(c)
         await s.commit()
         await s.refresh(c)
-        client_id = c.id
 
     await state.clear()
     await m.answer(f"تمت إضافة العميل: {name}")
-    # لا نعرف أي رسالة Callback نعدّلها، لذا نكتفي برسالة تأكيد.
-    # لاحقاً يمكن الرجوع لقائمة العملاء من الإعدادات.
-    
+
 
 # ============ عرض عميل واحد ============
 
@@ -201,7 +203,9 @@ async def admin_client_edit_name_input(m: Message, state: FSMContext):
             return
 
         # تحقق من عدم تكرار الاسم
-        res2 = await s.execute(select(Client).where(Client.name == new_name, Client.id != client_id))
+        res2 = await s.execute(
+            select(Client).where(Client.name == new_name, Client.id != client_id)
+        )
         exists = res2.scalar_one_or_none()
         if exists:
             await m.answer("يوجد عميل آخر بنفس الاسم. اختر اسماً مختلفاً.")
@@ -350,7 +354,6 @@ async def admin_client_overlay_input(m: Message, state: FSMContext):
     data = await state.get_data()
     client_id = data.get("client_id")
 
-    # نحاول أخذ الصورة من photo أو document
     file_id = None
     if m.photo:
         file_id = m.photo[-1].file_id
@@ -380,60 +383,12 @@ async def admin_client_overlay_input(m: Message, state: FSMContext):
     await state.clear()
 
 
-# ============ اختيار موديلات افتراضية للعميل ============
+# ============ تحريك ترتيب العميل ============
 
-def _client_models_list_kb(kind: str, client_id: int, rows):
-    kb = InlineKeyboardBuilder()
-    for m in rows:
-        status = "✅" if m.enabled else "❌"
-        kb.button(
-            text=f"{status} {m.model_id}",
-            callback_data=f"admin_client_pick_model:{kind}:{client_id}:{m.id}",
-        )
-    kb.button(text="⬅️ رجوع للعميل", callback_data=f"admin_client_view:{client_id}")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-@router.callback_query(F.data.startswith("admin_client_pick_model_menu:"))
-async def admin_client_pick_model_menu(c: CallbackQuery):
-    """
-    فتح قائمة اختيار موديل نص/صورة افتراضي للعميل من ModelCatalog.
-    """
-    parts = c.data.split(":")
-    _, kind, client_id_s = parts
+@router.callback_query(F.data.startswith("admin_client_move:"))
+async def admin_client_move(c: CallbackQuery):
+    _, client_id_s, direction = c.data.split(":")
     client_id = int(client_id_s)
-
-    rows = await list_models(kind, enabled_only=True)
-
-    text = f"اختر موديل { 'النص' if kind == 'text' else 'الصور' } الافتراضي للعميل:\n"
-    if not rows:
-        text += "لا يوجد موديلات مفعّلة لهذا النوع. أضفها من 'إدارة الموديلات'."
-
-    try:
-        await c.message.edit_text(text, reply_markup=_client_models_list_kb(kind, client_id, rows))
-    except Exception:
-        await c.message.answer(text, reply_markup=_client_models_list_kb(kind, client_id, rows))
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("admin_client_pick_model:"))
-async def admin_client_pick_model(c: CallbackQuery):
-    """
-    حفظ الموديل المختار في default_text_model أو default_image_model.
-    """
-    parts = c.data.split(":")
-    _, kind, client_id_s, row_id_s = parts
-    client_id = int(client_id_s)
-    row_id = int(row_id_s)
-
-    # نحصل على الموديل من list_models
-    rows = await list_models(kind, enabled_only=False)
-    model_row = next((r for r in rows if r.id == row_id), None)
-
-    if not model_row or not model_row.enabled:
-        await c.answer("هذا الموديل غير متاح.", show_alert=True)
-        return
 
     async with SessionLocal() as s:
         res = await s.execute(select(Client).where(Client.id == client_id))
@@ -442,14 +397,30 @@ async def admin_client_pick_model(c: CallbackQuery):
             await c.answer("العميل غير موجود.", show_alert=True)
             return
 
-        if kind == "text":
-            client.default_text_model = model_row.model_id
-        else:
-            client.default_image_model = model_row.model_id
+        if direction == "up":
+            res2 = await s.execute(
+                select(Client)
+                .where(Client.sort_order < client.sort_order)
+                .order_by(Client.sort_order.desc())
+                .limit(1)
+            )
+        else:  # down
+            res2 = await s.execute(
+                select(Client)
+                .where(Client.sort_order > client.sort_order)
+                .order_by(Client.sort_order.asc())
+                .limit(1)
+            )
+
+        neighbor = res2.scalar_one_or_none()
+        if not neighbor:
+            await c.answer("لا يمكن التحريك أكثر في هذا الاتجاه.", show_alert=True)
+            return
+
+        client.sort_order, neighbor.sort_order = neighbor.sort_order, client.sort_order
         await s.commit()
 
-    await c.answer("تم حفظ الموديل الافتراضي للعميل.")
-    # نرجع لعرض العميل
+    await c.answer("تم تحديث ترتيب العميل.")
     await _reload_client_view(c, client_id)
 
 
@@ -459,7 +430,6 @@ async def admin_client_pick_model(c: CallbackQuery):
 async def admin_client_delete(c: CallbackQuery):
     client_id = int(c.data.split(":")[1])
 
-    # تأكيد بسيط (يمكن تطويره لاحقاً)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ نعم، احذف", callback_data=f"admin_client_delete_confirm:{client_id}:yes")
     kb.button(text="❌ لا", callback_data="admin_clients_menu")
