@@ -26,7 +26,7 @@ from app.models import (
 )
 from app.permissions import get_or_create_user
 from app.config import DEFAULT_TEXT_MODEL, DEFAULT_IMAGE_MODEL
-from app.openrouter import chat, image_generate
+from app.openrouter import chat, image_generate, image_edit
 from app.overlay import apply_overlay_png
 
 router = Router()
@@ -36,7 +36,6 @@ class ClientGenState(StatesGroup):
     waiting_input = State()
 
 
-# نوع العملية -> نوع الموديل المطلوب
 OPERATION_KIND = {
     "text_generate": "text",
     "image_generate": "image",
@@ -50,15 +49,8 @@ OPERATION_KIND = {
 # ============ مساعدات عامة ============
 
 async def _get_accessible_clients(user: User) -> list[Client]:
-    """
-    يرجع قائمة العملاء التي يمكن للمستخدم الوصول إليها.
-    حالياً:
-      - المالك أو من لديه allow_all_clients أو can_manage_clients → كل العملاء.
-      - غير ذلك: (مستقبلاً يمكن ربط StaffClient، الآن نعيد كل العملاء أيضاً لتبسيط الاستخدام).
-    """
     async with SessionLocal() as s:
-        # يمكنك لاحقاً تفعيل الربط مع StaffClient هنا
-        res = await s.execute(select(Client).order_by(Client.name.asc()))
+        res = await s.execute(select(Client).order_by(Client.sort_order.asc(), Client.name.asc()))
         clients = list(res.scalars().all())
     return clients
 
@@ -93,7 +85,6 @@ def _user_section_kb(
         )
 
     if parent_section is None:
-        # نحن في الجذر
         kb.button(text="⬅️ رجوع لاختيار عميل", callback_data="clients_menu")
     else:
         if parent_section.parent_id is None:
@@ -115,9 +106,6 @@ def _user_section_kb(
 
 
 async def _download_file_bytes(message: Message, file_id: str) -> bytes:
-    """
-    تنزيل ملف (صورة/فيديو) من تيليجرام وإرجاعه كـ bytes.
-    """
     file = await message.bot.get_file(file_id)
     buf = BytesIO()
     await message.bot.download(file, buf)
@@ -128,29 +116,21 @@ async def _download_file_bytes(message: Message, file_id: str) -> bytes:
 async def _resolve_model(
     t: Template,
     client: Client,
-) -> tuple[str, Optional[str]]:
-    """
-    يحدد model_id المناسب للنموذج والعميل بناءً على نوع العملية.
-    يرجع (model_id, kind)
-    """
+) -> tuple[Optional[str], Optional[str]]:
     op = t.operation
     kind = OPERATION_KIND.get(op)
 
-    # نوع الموديل حسب العملية
+    # اختيار موديل افتراضي حسب النوع (بدون اعتماد على العميل)
     if kind == "text":
-        fallback = client.default_text_model or DEFAULT_TEXT_MODEL
+        model_id: Optional[str] = DEFAULT_TEXT_MODEL
     elif kind == "image":
-        fallback = client.default_image_model or DEFAULT_IMAGE_MODEL
-    elif kind == "video":
-        fallback = None  # لم ننفذ حالياً
-    elif kind == "audio":
-        fallback = None  # لم ننفذ حالياً
+        model_id = DEFAULT_IMAGE_MODEL
+    elif kind in ("video", "audio"):
+        model_id = None
     else:
-        fallback = None
+        model_id = None
 
-    model_id = fallback
-
-    # نحاول قراءة الموديل من ModelCatalog
+    # نحاول override من ModelCatalog
     async with SessionLocal() as s:
         res = await s.execute(
             select(ModelCatalog).where(ModelCatalog.id == t.model_catalog_id)
@@ -182,7 +162,7 @@ async def clients_menu(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-# ============ 2) عرض الأقسام للجذر (root) للعميل ============
+# ============ 2) عرض الأقسام للجذر للعميل ============
 
 async def _render_user_sections_root(c: CallbackQuery, client_id: int):
     async with SessionLocal() as s:
@@ -193,7 +173,6 @@ async def _render_user_sections_root(c: CallbackQuery, client_id: int):
         )
         sections = list(res_sec.scalars().all())
 
-        # النماذج في الأقسام الجذرية (نعتبر أن النموذج يعود لقسم رئيسي بلا أب)
         res_tpl = await s.execute(
             select(Template)
             .join(Section, Section.id == Template.section_id)
@@ -202,7 +181,7 @@ async def _render_user_sections_root(c: CallbackQuery, client_id: int):
                 Section.is_active == True,  # noqa
                 Template.is_active == True,  # noqa
             )
-            .order_by(Template.name.asc())
+            .order_by(Template.sort_order.asc(), Template.name.asc())
         )
         templates = list(res_tpl.scalars().all())
 
@@ -218,7 +197,7 @@ async def _render_user_sections_root(c: CallbackQuery, client_id: int):
 @router.callback_query(F.data.startswith("user_client_pick:"))
 async def user_client_pick(c: CallbackQuery, state: FSMContext):
     client_id = int(c.data.split(":")[1])
-    await state.update_data(client_id=client_id)
+    await state.update_data(client_id=client_id, multi_images=[])
     await _render_user_sections_root(c, client_id)
 
 
@@ -228,7 +207,7 @@ async def user_client_root(c: CallbackQuery):
     await _render_user_sections_root(c, client_id)
 
 
-# ============ 3) عرض الأقسام الفرعية والنماذج لقسم معيّن ============
+# ============ 3) عرض الأقسام الفرعية والنماذج ============
 
 async def _render_user_section(c: CallbackQuery, client_id: int, section_id: int):
     async with SessionLocal() as s:
@@ -251,7 +230,7 @@ async def _render_user_section(c: CallbackQuery, client_id: int, section_id: int
                 Template.section_id == section_id,
                 Template.is_active == True,  # noqa
             )
-            .order_by(Template.name.asc())
+            .order_by(Template.sort_order.asc(), Template.name.asc())
         )
         templates = list(res_tpl.scalars().all())
 
@@ -272,7 +251,7 @@ async def user_section_open(c: CallbackQuery):
     await _render_user_section(c, client_id, section_id)
 
 
-# ============ 4) اختيار نموذج وطلب المدخلات من المستخدم ============
+# ============ 4) اختيار نموذج وبدء جمع المدخلات ============
 
 @router.callback_query(F.data.startswith("user_template_pick:"))
 async def user_template_pick(c: CallbackQuery, state: FSMContext):
@@ -288,11 +267,9 @@ async def user_template_pick(c: CallbackQuery, state: FSMContext):
         await c.answer("النموذج غير متاح حالياً.", show_alert=True)
         return
 
-    # نحفظ في الحالة
-    await state.update_data(client_id=client_id, template_id=template_id)
+    await state.update_data(client_id=client_id, template_id=template_id, multi_images=[])
     await state.set_state(ClientGenState.waiting_input)
 
-    # نص التعليمات حسب نوع الملفات المطلوبة
     fr = t.file_requirement
 
     if fr == "none":
@@ -303,20 +280,19 @@ async def user_template_pick(c: CallbackQuery, state: FSMContext):
     elif fr == "image_single":
         msg = (
             f"النموذج: {t.name}\n\n"
-            "أرسل الآن صورة واحدة مع كتابة التعليمات في الوصف (Caption).\n"
-            "ستُستخدم الصورة كمرجع، والنص لتوضيح المطلوب."
+            "أرسل الآن صورة واحدة مع كتابة التعليمات في الوصف (Caption)."
         )
     elif fr == "image_multi":
         msg = (
             f"النموذج: {t.name}\n\n"
-            "أرسل الآن صورة واحدة مع التعليمات في الوصف.\n"
-            "حالياً ندعم صورة واحدة فقط، وسيتم تحسين دعم عدة صور لاحقاً."
+            "أرسل الصور واحدة تلو الأخرى (كصور أو ملفات صورة).\n"
+            "بعد الانتهاء من إرسال كل الصور، أرسل رسالة أخيرة تحتوي فقط على التعليمات النصية (بدون صور)."
         )
     elif fr == "video_single":
         msg = (
             f"النموذج: {t.name}\n\n"
             "أرسل الآن فيديو واحد مع التعليمات في الوصف.\n"
-            "تنبيه: عمليات الفيديو لم تُنفّذ بعد في البوت، سنعرض رسالة بذلك."
+            "تنبيه: عمليات الفيديو لم تُنفّذ بعد في البوت، سيتم إبلاغك بذلك."
         )
     else:
         msg = (
@@ -328,7 +304,7 @@ async def user_template_pick(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-# ============ 5) استقبال المدخلات وتنفيذ التوليد ============
+# ============ 5) استقبال المدخلات وتنفيذ التوليد/التعديل ============
 
 @router.message(ClientGenState.waiting_input)
 async def user_template_input(m: Message, state: FSMContext):
@@ -362,14 +338,55 @@ async def user_template_input(m: Message, state: FSMContext):
     op = t.operation
     fr = t.file_requirement
 
-    # جمع نص المستخدم
+    # ========== حالة image_multi (جمع عدة صور ثم نص التعليمات) ==========
+    if fr == "image_multi":
+        state_data = await state.get_data()
+        images: list[bytes] = state_data.get("multi_images", [])
+
+        # هل تحتوي الرسالة على صورة؟
+        file_id = None
+        if m.photo:
+            file_id = m.photo[-1].file_id
+        elif m.document and (m.document.mime_type or "").startswith("image/"):
+            file_id = m.document.file_id
+
+        if file_id:
+            img_bytes = await _download_file_bytes(m, file_id)
+            images.append(img_bytes)
+            await state.update_data(multi_images=images)
+            await m.answer(
+                f"تم حفظ الصورة رقم {len(images)}.\n"
+                "يمكنك إرسال صورة أخرى، أو أرسل رسالة نصية فقط تحتوي على التعليمات عندما تنتهي."
+            )
+            return
+
+        # لا توجد صورة في هذه الرسالة → نفترض أنها رسالة التعليمات النهائية
+        user_text = (m.text or m.caption or "").strip()
+        if not images:
+            await m.answer(
+                "لم أستلم أي صورة بعد.\n"
+                "أرسل صورة واحدة على الأقل، ثم أرسل رسالة نصية بالتعليمات."
+            )
+            return
+        if not user_text:
+            await m.answer("أرسل الآن رسالة نصية تحتوي فقط على التعليمات المطلوبة.")
+            return
+
+        try:
+            await _handle_image_generate(m, client, t, model_id, user_text, images)
+        except Exception as e:
+            await m.answer(f"حدث خطأ أثناء التوليد:\n{e}")
+
+        await state.clear()
+        return
+
+    # ========== باقي حالات الملفات ==========
     user_text = (m.text or "") if m.text else (m.caption or "")
 
-    # صور/فيديو إن وجدت
     input_images: list[bytes] = []
     input_video: Optional[bytes] = None
 
-    if fr in ("image_single", "image_multi"):
+    if fr == "image_single":
         file_id = None
         if m.photo:
             file_id = m.photo[-1].file_id
@@ -391,20 +408,28 @@ async def user_template_input(m: Message, state: FSMContext):
             await m.answer("هذا النموذج يحتاج فيديو واحد. الرجاء إرسال فيديو مع الوصف.")
             return
 
-    # معالجة حسب نوع العملية
+    # ========== تنفيذ حسب نوع العملية ==========
     try:
         if op == "text_generate":
             await _handle_text_generate(m, client, t, model_id, user_text)
         elif op == "image_generate":
             await _handle_image_generate(m, client, t, model_id, user_text, input_images)
+        elif op == "image_edit":
+            # تعديل صورة: لا نستخدم برومبت الهوية ولا الكليشة
+            base_img = input_images[0] if input_images else None
+            await _handle_image_edit(m, t, model_id, user_text, base_img)
+        elif op in ("video_generate", "video_edit", "audio_generate"):
+            await m.answer(
+                f"النموذج مضبوط على عملية: {op}\n"
+                "واجهة هذه العملية جاهزة، لكن التنفيذ الفعلي لم يتم بعد في هذا الإصدار من البوت."
+            )
         else:
             await m.answer(
-                f"هذا النموذج مضبوط على عملية: {op}\n"
-                "لكن هذه العملية لم تُنفّذ بعد في البوت الحالي.\n"
-                "يمكنك طلب من الإدارة تفعيل دعم هذا النوع مستقبلاً."
+                f"هذا النموذج مضبوط على عملية غير معروفة: {op}\n"
+                "تواصل مع الإدارة لتصحيح الإعدادات."
             )
     except Exception as e:
-        await m.answer(f"حدث خطأ أثناء التوليد:\n{e}")
+        await m.answer(f"حدث خطأ أثناء المعالجة:\n{e}")
 
     await state.clear()
 
@@ -448,7 +473,6 @@ async def _handle_image_generate(
     user_text: str,
     input_images: list[bytes],
 ):
-    # نجمع البرومبت النهائي
     prompt_parts = []
 
     if client.brand_prompt:
@@ -461,7 +485,6 @@ async def _handle_image_generate(
         prompt_parts.append(f"مدخلات المستخدم:\n{user_text}")
 
     full_prompt = "\n\n".join(prompt_parts) or "صمم صورة تناسب هذا العميل."
-
     size = f"{client.design_width}x{client.design_height}"
 
     msg = await m.answer("🖼️ جاري توليد الصورة...")
@@ -473,15 +496,57 @@ async def _handle_image_generate(
             input_images=input_images or None,
         )
 
-        # تركيب الكليشة إن وجدت
         if client.overlay_path:
             img_bytes = apply_overlay_png(img_bytes, client.overlay_path)
 
         await msg.delete()
-        await m.bot.send_photo(
-            m.chat.id,
-            BufferedInputFile(img_bytes, filename="result.png"),
-        )
+
+        photo_input = BufferedInputFile(img_bytes, filename="result.png")
+        doc_input = BufferedInputFile(img_bytes, filename="result.png")
+
+        await m.bot.send_photo(m.chat.id, photo_input)
+        await m.bot.send_document(m.chat.id, doc_input)
     except Exception as e:
         await msg.delete()
         await m.answer(f"فشل توليد الصورة:\n{e}")
+
+
+async def _handle_image_edit(
+    m: Message,
+    t: Template,
+    model_id: str,
+    user_text: str,
+    base_image_bytes: Optional[bytes],
+):
+    if not base_image_bytes:
+        await m.answer("هذا النموذج يحتاج صورة كأساس للتعديل. الرجاء إرسال صورة.")
+        return
+
+    prompt_parts = []
+    if t.base_prompt:
+        prompt_parts.append(f"تعليمات النموذج:\n{t.base_prompt}")
+    if user_text:
+        prompt_parts.append(f"تعليمات المستخدم:\n{user_text}")
+
+    full_prompt = "\n\n".join(prompt_parts) or "قم بإجراء التعديلات المطلوبة على الصورة."
+
+    msg = await m.answer("✏️ جاري تعديل الصورة...")
+    try:
+        edited_bytes = await image_edit(
+            model=model_id,
+            image_bytes=base_image_bytes,
+            prompt=full_prompt,
+            strength=0.3,
+            size=None,  # نحافظ على مقاس الصورة الأصلية
+        )
+        await msg.delete()
+
+        photo_input = BufferedInputFile(edited_bytes, filename="edited.png")
+        doc_input = BufferedInputFile(edited_bytes, filename="edited.png")
+
+        # لا نركّب كليشة في التعديل؛ الصورة الأصلية غالباً تحتويها
+        await m.bot.send_photo(m.chat.id, photo_input)
+        await m.bot.send_document(m.chat.id, doc_input)
+    except Exception as e:
+        await msg.delete()
+        await m.answer(f"فشل تعديل الصورة:\n{e}")
