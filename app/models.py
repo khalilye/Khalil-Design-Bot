@@ -50,7 +50,7 @@ class StaffClient(Base):
     client_id: Mapped[int] = mapped_column(Integer, ForeignKey("clients.id"), primary_key=True)
 
 
-# ============= العملاء (سنستخدمه لاحقاً في الخطوة القادمة) =============
+# ============= العملاء =============
 
 class Client(Base):
     __tablename__ = "clients"
@@ -65,8 +65,12 @@ class Client(Base):
     design_width: Mapped[int] = mapped_column(Integer, default=1080)
     design_height: Mapped[int] = mapped_column(Integer, default=1080)
 
+    # حقول افتراضية سابقة (لن نستخدمها الآن لسهولة الإدارة، لكن نتركها في الـ DB)
     default_text_model: Mapped[str] = mapped_column(String(80), default="")
     default_image_model: Mapped[str] = mapped_column(String(80), default="")
+
+    # ترتيب العرض في القوائم
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
 
 # ============= كتالوج موديلات الذكاء الاصطناعي =============
@@ -131,3 +135,6 @@ class Template(Base):
     file_requirement: Mapped[str] = mapped_column(String(20), default="none")
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # ترتيب العرض داخل القسم
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
