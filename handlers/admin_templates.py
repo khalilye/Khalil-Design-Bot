@@ -22,7 +22,6 @@ class TemplateEditState(StatesGroup):
     editing_prompt = State()
 
 
-# العمليات المتاحة
 OPERATION_CHOICES = [
     ("text_generate", "📝 توليد نص"),
     ("image_generate", "🖼️ توليد صورة"),
@@ -32,7 +31,6 @@ OPERATION_CHOICES = [
     ("audio_generate", "🎧 توليد صوت"),
 ]
 
-# نوع الموديل المطلوب لكل عملية
 OPERATION_KIND = {
     "text_generate": "text",
     "image_generate": "image",
@@ -42,7 +40,6 @@ OPERATION_KIND = {
     "audio_generate": "audio",
 }
 
-# متطلبات الملفات
 FILE_REQUIREMENT_CHOICES = [
     ("none", "بدون ملفات"),
     ("image_single", "📷 صورة واحدة"),
@@ -84,6 +81,8 @@ def _template_manage_kb(t: Template):
     kb.button(text="⚙️ نوع العملية", callback_data=f"admin_template_operation:{t.id}")
     kb.button(text="🧠 اختيار الموديل", callback_data=f"admin_template_model:{t.id}")
     kb.button(text="📎 نوع الملفات المطلوبة", callback_data=f"admin_template_files:{t.id}")
+    kb.button(text="⬆️ تحريك لأعلى", callback_data=f"admin_template_move:{t.id}:up")
+    kb.button(text="⬇️ تحريك لأسفل", callback_data=f"admin_template_move:{t.id}:down")
     kb.button(
         text=("🔴 تعطيل النموذج" if t.is_active else "🟢 تفعيل النموذج"),
         callback_data=f"admin_template_toggle:{t.id}",
@@ -105,7 +104,7 @@ async def _render_templates_for_section(c: CallbackQuery, section_id: int):
         res_t = await s.execute(
             select(Template)
             .where(Template.section_id == section_id)
-            .order_by(Template.name.asc())
+            .order_by(Template.sort_order.asc(), Template.name.asc())
         )
         templates = list(res_t.scalars().all())
 
@@ -158,28 +157,37 @@ async def admin_template_add_name(m: Message, state: FSMContext):
         await m.answer("الرجاء إرسال اسم صالح.")
         return
 
-    # ننشئ نموذج بمعلومات افتراضية (سيعدلها لاحقاً من لوحة الإدارة)
     async with SessionLocal() as s:
-        # نحتاج موديل افتراضي (أي موديل مفعّل من أي نوع)، إن لم يوجد نتركه 0 (غير صالح)
+        # حساب sort_order داخل هذا القسم
+        res_order = await s.execute(
+            select(Template.sort_order).where(Template.section_id == section_id)
+        )
+        orders = [o for (o,) in res_order.all()]
+        next_order = (max(orders) + 1) if orders else 0
+
+        # نحتاج موديل افتراضي (أول موديل موجود إن وجد)
         res_model = await s.execute(select(ModelCatalog).limit(1))
         model = res_model.scalar_one_or_none()
-        model_id = model.id if model else 0
+        model_id = model.id if model else 1
 
         t = Template(
             name=name,
             section_id=section_id,
             base_prompt="",
-            operation="image_generate",  # افتراضي
-            model_catalog_id=model_id or 1,  # إن لم يوجد موديلات يجب تعديلها لاحقاً
+            operation="image_generate",
+            model_catalog_id=model_id,
             file_requirement="none",
             is_active=True,
+            sort_order=next_order,
         )
         s.add(t)
         await s.commit()
         await s.refresh(t)
 
-    await m.answer(f"تمت إضافة النموذج: {name}\n"
-                   f"الرجاء ضبط نوع العملية والموديل والبرومبت من لوحة إدارة النموذج.")
+    await m.answer(
+        f"تمت إضافة النموذج: {name}\n"
+        f"الرجاء ضبط نوع العملية والموديل والبرومبت من لوحة إدارة النموذج."
+    )
     await state.clear()
 
 
@@ -190,14 +198,9 @@ async def admin_template_view(c: CallbackQuery):
     template_id = int(c.data.split(":")[1])
 
     async with SessionLocal() as s:
-        res = await s.execute(
-            select(Template)
-            .where(Template.id == template_id)
-            .options()
-        )
+        res = await s.execute(select(Template).where(Template.id == template_id))
         t = res.scalar_one_or_none()
         if t:
-            # نجلب أيضاً الموديل
             res_m = await s.execute(select(ModelCatalog).where(ModelCatalog.id == t.model_catalog_id))
             mrow = res_m.scalar_one_or_none()
         else:
@@ -217,6 +220,7 @@ async def admin_template_view(c: CallbackQuery):
         f"العملية: {t.operation} (نوع الموديل: {kind})\n"
         f"الموديل: {model_name}\n"
         f"نوع الملفات المطلوبة: {t.file_requirement}\n"
+        f"الترتيب داخل القسم: {t.sort_order}\n"
         f"الحالة: {'✅ مفعل' if t.is_active else '❌ غير مفعل'}\n"
         f"\n"
         f"برومبت أساسي (مختصر):\n"
@@ -491,13 +495,59 @@ async def admin_template_toggle(c: CallbackQuery):
     await admin_template_view(c)
 
 
+# ============ تحريك ترتيب النموذج داخل القسم ============
+
+@router.callback_query(F.data.startswith("admin_template_move:"))
+async def admin_template_move(c: CallbackQuery):
+    _, template_id_s, direction = c.data.split(":")
+    template_id = int(template_id_s)
+
+    async with SessionLocal() as s:
+        res = await s.execute(select(Template).where(Template.id == template_id))
+        t = res.scalar_one_or_none()
+        if not t:
+            await c.answer("النموذج غير موجود.", show_alert=True)
+            return
+
+        if direction == "up":
+            res2 = await s.execute(
+                select(Template)
+                .where(
+                    Template.section_id == t.section_id,
+                    Template.sort_order < t.sort_order,
+                )
+                .order_by(Template.sort_order.desc())
+                .limit(1)
+            )
+        else:
+            res2 = await s.execute(
+                select(Template)
+                .where(
+                    Template.section_id == t.section_id,
+                    Template.sort_order > t.sort_order,
+                )
+                .order_by(Template.sort_order.asc())
+                .limit(1)
+            )
+
+        neighbor = res2.scalar_one_or_none()
+        if not neighbor:
+            await c.answer("لا يمكن التحريك أكثر في هذا الاتجاه.", show_alert=True)
+            return
+
+        t.sort_order, neighbor.sort_order = neighbor.sort_order, t.sort_order
+        await s.commit()
+
+    await c.answer("تم تحديث ترتيب النموذج.")
+    await admin_template_view(c)
+
+
 # ============ حذف نموذج ============
 
 @router.callback_query(F.data.startswith("admin_template_delete:"))
 async def admin_template_delete(c: CallbackQuery):
     template_id = int(c.data.split(":")[1])
 
-    # تأكيد بسيط
     kb = InlineKeyboardBuilder()
     kb.button(
         text="✅ نعم، احذف",
@@ -531,12 +581,4 @@ async def admin_template_delete_confirm(c: CallbackQuery):
         await s.commit()
 
     await c.answer("تم حذف النموذج.")
-    await admin_templates_menu(
-        CallbackQuery(
-            id=c.id,
-            from_user=c.from_user,
-            chat_instance=c.chat_instance,
-            message=c.message,
-            data=f"admin_templates_menu:{section_id}",
-        )
-    )
+    await _render_templates_for_section(c, section_id)
