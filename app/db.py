@@ -4,9 +4,6 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from app.config import DATABASE_URL
 from app.models import Base
 
-# محرك واحد بسيط - SQLAlchemy يختار الدرايفر حسب DATABASE_URL:
-# - لو sqlite+aiosqlite → يستخدم aiosqlite
-# - لو postgresql+asyncpg → يستخدم asyncpg (لن نستخدمه الآن في Render)
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
