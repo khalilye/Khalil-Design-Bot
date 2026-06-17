@@ -51,7 +51,7 @@ async def _post_json(path: str, payload: dict, timeout: int = 180) -> dict:
 
 
 async def _download(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         r = await client.get(url)
         if r.status_code >= 400:
             raise RuntimeError(f"{r.status_code} GET {url}\n{_short(r.text)}")
@@ -59,6 +59,10 @@ async def _download(url: str) -> bytes:
 
 
 def _extract_image_pointer_from_chat(js: dict) -> str | None:
+    """
+    يحاول استخراج مؤشر صورة (URL أو data:image) من استجابة chat/completions
+    الخاصة بنماذج الصور.
+    """
     try:
         choice0 = js["choices"][0]
     except Exception:
@@ -107,9 +111,24 @@ def _extract_image_pointer_from_chat(js: dict) -> str | None:
 
 
 async def _pointer_to_bytes(pointer: str) -> bytes:
+    """
+    خاص بالصور: pointer قد يكون data:image أو URL.
+    """
     if pointer.startswith("data:image"):
         b64 = pointer.split("base64,", 1)[1]
         return base64.b64decode(b64)
+    return await _download(pointer)
+
+
+async def _pointer_to_bytes_any(pointer: str) -> bytes:
+    """
+    وسائط عامة (صوت/فيديو/صورة...) من data:... أو URL.
+    """
+    if pointer.startswith("data:"):
+        # نتوقع data:audio/...;base64,... أو data:video/...;base64,...
+        if "base64," in pointer:
+            b64 = pointer.split("base64,", 1)[1]
+            return base64.b64decode(b64)
     return await _download(pointer)
 
 
@@ -140,7 +159,16 @@ async def chat(model: str, system: str, user: str) -> str:
         "temperature": 0.7,
     }
     js = await _post_json("/chat/completions", payload, timeout=120)
-    return js["choices"][0]["message"]["content"]
+    content = js["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        # بعض الموديلات ترجع content كقائمة أجزاء نصية
+        text_out = "".join(
+            (part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text")
+        )
+        return text_out or str(content)
+    return str(content)
 
 
 async def image_generate(
@@ -236,7 +264,7 @@ async def image_edit(
     """
     تعديل صورة واحدة بناءً على تعليمات نصية.
     - لا نضيف أي لوجو جديد.
-    - لا نغيّر المقاس إلا إذا تم تمرير size بشكل صريح.
+    - لا نغيّر المقاس إلا إذا تم تمرير size.
     """
     data_url = _to_data_url(image_bytes)
 
@@ -295,10 +323,115 @@ IMPORTANT:
 
     raise RuntimeError("فشل تعديل الصورة عبر OpenRouter:\n" + "\n---\n".join(errors))
 
+
+async def audio_generate(model: str, text: str) -> bytes:
+    """
+    توليد صوت من نص.
+    هذه دالة عامة تعتمد على أن الموديل (مثلاً openai/gpt-audio أو نحو ذلك)
+    يمكنه إرجاع:
+      - إما data:audio/...;base64,...
+      - أو رابط مباشر لملف صوتي (mp3/wav/ogg...)
+    يجب أن تصيغ برومبت النموذج بحيث يلتزم بإرجاع رابط أو data:audio فقط.
+    """
+    instruction = f"""{text}
+
+IMPORTANT:
+- Generate an audio clip according to the user's request.
+- Return ONLY ONE of the following:
+    1) A direct HTTP(S) URL to an audio file (e.g. .mp3, .wav, .m4a, .ogg), OR
+    2) A data:audio/...;base64,... string.
+- Do NOT include any extra text, explanation, or markdown.
+"""
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": instruction},
+        ],
+    }
+    js = await _post_json("/chat/completions", payload, timeout=300)
+    msg = (js.get("choices") or [{}])[0].get("message") or {}
+    content = msg.get("content")
+
+    if isinstance(content, list):
+        # نجمع كل أجزاء النص
+        text_out = "".join(
+            (part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text")
+        )
+    else:
+        text_out = str(content or "")
+
+    text_out = (text_out or "").strip()
+    pointer: Optional[str] = None
+
+    if text_out.startswith("data:audio"):
+        pointer = text_out
+    else:
+        pointer = _extract_url_from_text(text_out)
+
+    if not pointer:
+        raise RuntimeError(f"لم أستطع استخراج رابط/بيانات صوت من استجابة الموديل:\n{text_out[:500]}")
+
+    return await _pointer_to_bytes_any(pointer)
+
+
+async def video_generate(model: str, text: str) -> bytes:
+    """
+    توليد فيديو من نص (أو وصف).
+    نفس الفكرة: نعتمد على أن الموديل يرجع:
+      - data:video/...;base64,...
+      - أو رابط مباشر لملف فيديو (mp4/webm/...).
+    يجب صياغة البرومبت ليلتزم بذلك.
+    """
+    instruction = f"""{text}
+
+IMPORTANT:
+- Generate a short video that matches the user's request.
+- Return ONLY ONE of the following:
+    1) A direct HTTP(S) URL to a video file (e.g. .mp4, .webm), OR
+    2) A data:video/...;base64,... string.
+- Do NOT include any extra text, explanation, or markdown.
+"""
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": instruction},
+        ],
+    }
+    js = await _post_json("/chat/completions", payload, timeout=600)
+    msg = (js.get("choices") or [{}])[0].get("message") or {}
+    content = msg.get("content")
+
+    if isinstance(content, list):
+        text_out = "".join(
+            (part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text")
+        )
+    else:
+        text_out = str(content or "")
+
+    text_out = (text_out or "").strip()
+    pointer: Optional[str] = None
+
+    if text_out.startswith("data:video"):
+        pointer = text_out
+    else:
+        pointer = _extract_url_from_text(text_out)
+
+    if not pointer:
+        raise RuntimeError(f"لم أستطع استخراج رابط/بيانات فيديو من استجابة الموديل:\n{text_out[:500]}")
+
+    return await _pointer_to_bytes_any(pointer)
+
+
 async def fetch_available_models() -> list[dict]:
     """
     يستعلم قائمة الموديلات من OpenRouter ويعيدها كقائمة dicts.
-    لا نقوم بأي تحويل، فقط نرجع data كما هي (غالباً في المفتاح 'data').
+    نستخدمها لإرسال ملف نصي فيه أسماء الموديلات.
     """
     _require_key()
     url = f"{OPENROUTER_BASE_URL}/models"
