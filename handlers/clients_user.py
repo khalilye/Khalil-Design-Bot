@@ -26,7 +26,7 @@ from app.models import (
 )
 from app.permissions import get_or_create_user
 from app.config import DEFAULT_TEXT_MODEL, DEFAULT_IMAGE_MODEL
-from app.openrouter import chat, image_generate, image_edit
+from app.openrouter import chat, image_generate, image_edit, audio_generate, video_generate
 from app.overlay import apply_overlay_png
 
 router = Router()
@@ -126,15 +126,13 @@ async def _resolve_model(
     op = t.operation
     kind = OPERATION_KIND.get(op)
 
-    # افتراض عام حسب النوع
+    # افتراض عام حسب النوع (للأمان، قد لا يُستخدم إن كانت Template مرتبطة بموديل)
     if kind == "text":
         model_id: Optional[str] = DEFAULT_TEXT_MODEL
     elif kind == "image":
         model_id = DEFAULT_IMAGE_MODEL
-    elif kind in ("video", "audio"):
-        model_id = None
     else:
-        model_id = None
+        model_id = None  # audio/video سيأتي من Template/ModelCatalog
 
     # override من ModelCatalog إن وجد
     async with SessionLocal() as s:
@@ -279,7 +277,6 @@ async def user_template_pick(c: CallbackQuery, state: FSMContext):
     op = t.operation
     fr = t.file_requirement
 
-    # حالة خاصة: image_multi (عدة صور) مع image_generate
     if op == "image_generate" and fr == "image_multi":
         msg = (
             f"النموذج: {t.name}\n\n"
@@ -304,11 +301,17 @@ async def user_template_pick(c: CallbackQuery, state: FSMContext):
             "أرسل النص المطلوب.\n"
             "حالياً لا يتم استخدام الصور في توليد النص في هذا الإصدار."
         )
-    elif op in ("video_generate", "video_edit", "audio_generate"):
+    elif op == "audio_generate":
         msg = (
             f"النموذج: {t.name}\n\n"
-            "هذه العملية مخصّصة للفيديو/الصوت.\n"
-            "الواجهة جاهزة، لكن التنفيذ الفعلي لهذه العمليات لم يُطبق بعد."
+            "أرسل النص الذي تريد تحويله إلى صوت.\n"
+            "تأكد أن الموديل المرتبط بهذا النموذج من نوع audio في 'إدارة الموديلات'."
+        )
+    elif op == "video_generate":
+        msg = (
+            f"النموذج: {t.name}\n\n"
+            "أرسل وصفاً للفيديو المطلوب.\n"
+            "تأكد أن الموديل المرتبط بهذا النموذج من نوع video في 'إدارة الموديلات'."
         )
     else:
         msg = (
@@ -359,7 +362,6 @@ async def user_template_input(m: Message, state: FSMContext):
         state_data = await state.get_data()
         images: list[bytes] = state_data.get("multi_images", [])
 
-        # هل تحتوي الرسالة على صورة؟
         file_id = None
         if m.photo:
             file_id = m.photo[-1].file_id
@@ -376,7 +378,6 @@ async def user_template_input(m: Message, state: FSMContext):
             )
             return
 
-        # لا توجد صورة في الرسالة الحالية → نفترض أنها رسالة التعليمات النهائية
         user_text = (m.text or m.caption or "").strip()
         if not images:
             await m.answer(
@@ -396,13 +397,12 @@ async def user_template_input(m: Message, state: FSMContext):
         await state.clear()
         return
 
-    # ===== باقي الحالات (مرنة) =====
+    # ===== باقي الحالات =====
     user_text = (m.text or "") if m.text else (m.caption or "")
 
     input_images: list[bytes] = []
     input_video: Optional[bytes] = None
 
-    # نقرأ أي صورة/ملف صورة إن وُجد (اختياري)
     if m.photo:
         file_id = m.photo[-1].file_id
         img_bytes = await _download_file_bytes(m, file_id)
@@ -412,12 +412,10 @@ async def user_template_input(m: Message, state: FSMContext):
         img_bytes = await _download_file_bytes(m, file_id)
         input_images.append(img_bytes)
 
-    # نقرأ فيديو إن وُجد (اختياري)
     if m.video:
         vid_id = m.video.file_id
         input_video = await _download_file_bytes(m, vid_id)
 
-    # معالجة حسب نوع العملية
     try:
         if op == "text_generate":
             await _handle_text_generate(m, client, t, model_id, user_text)
@@ -426,15 +424,14 @@ async def user_template_input(m: Message, state: FSMContext):
         elif op == "image_edit":
             base_img = input_images[0] if input_images else None
             await _handle_image_edit(m, t, model_id, user_text, base_img)
-        elif op in ("video_generate", "video_edit", "audio_generate"):
-            await m.answer(
-                f"النموذج مضبوط على عملية: {op}\n"
-                "الواجهة جاهزة، لكن التنفيذ الفعلي لهذه العملية لم يتم بعد في هذا الإصدار."
-            )
+        elif op == "audio_generate":
+            await _handle_audio_generate(m, client, t, model_id, user_text)
+        elif op == "video_generate":
+            await _handle_video_generate(m, client, t, model_id, user_text)
         else:
             await m.answer(
-                f"هذا النموذج مضبوط على عملية غير معروفة: {op}\n"
-                "تواصل مع الإدارة لتصحيح الإعدادات."
+                f"هذا النموذج مضبوط على عملية: {op}\n"
+                "تأكد من أن هذه العملية مدعومة ومضبوطة بشكل صحيح."
             )
     except Exception as e:
         await m.answer(f"حدث خطأ أثناء المعالجة:\n{e}")
@@ -481,7 +478,6 @@ async def _handle_image_generate(
     user_text: str,
     input_images: list[bytes],
 ):
-    # تركيب البرومبت النهائي
     prompt_parts = []
 
     if client.brand_prompt:
@@ -498,7 +494,7 @@ async def _handle_image_generate(
 
     msg = await m.answer("🖼️ جاري توليد الصورة...")
     try:
-        # الصورة الأصلية كما رجعت من الموديل (بدون كليشة)
+        # الصورة الأصلية كما رجعت من الموديل
         base_img_bytes = await image_generate(
             model=model_id,
             prompt=full_prompt,
@@ -506,14 +502,14 @@ async def _handle_image_generate(
             input_images=input_images or None,
         )
 
-        # صورة للعرض بعد تركيب الكليشة (إن وجدت)
+        # صورة نهائية مع الكليشة (إن وجدت)
         final_img_bytes = base_img_bytes
         if client.overlay_path:
             final_img_bytes = apply_overlay_png(base_img_bytes, client.overlay_path)
 
         await msg.delete()
 
-        # 1) إرسال الصورة (Photo) بالكليشة
+        # 1) Photo بالكليشة
         photo_input = BufferedInputFile(final_img_bytes, filename="result.png")
         await m.bot.send_photo(m.chat.id, photo_input)
 
@@ -521,7 +517,7 @@ async def _handle_image_generate(
         doc_with_overlay = BufferedInputFile(final_img_bytes, filename="result_with_overlay.png")
         await m.bot.send_document(m.chat.id, doc_with_overlay)
 
-        # 3) مستند إضافي بالصورة الأصلية من الموديل (بدون كليشة)
+        # 3) مستند بالصورة الأصلية من الموديل بدون كليشة
         if client.overlay_path:
             doc_original = BufferedInputFile(base_img_bytes, filename="result_original_no_overlay.png")
             await m.bot.send_document(m.chat.id, doc_original)
@@ -557,16 +553,80 @@ async def _handle_image_edit(
             image_bytes=base_image_bytes,
             prompt=full_prompt,
             strength=0.3,
-            size=None,  # نحافظ على مقاس الصورة الأصلي
+            size=None,  # لا نغيّر المقاس
         )
         await msg.delete()
 
         photo_input = BufferedInputFile(edited_bytes, filename="edited.png")
         doc_input = BufferedInputFile(edited_bytes, filename="edited.png")
 
-        # لا نركّب كليشة في التعديل؛ الصورة الأصلية غالباً تحتويها
         await m.bot.send_photo(m.chat.id, photo_input)
         await m.bot.send_document(m.chat.id, doc_input)
     except Exception as e:
         await msg.delete()
         await m.answer(f"فشل تعديل الصورة:\n{e}")
+
+
+async def _handle_audio_generate(
+    m: Message,
+    client: Client,
+    t: Template,
+    model_id: str,
+    user_text: str,
+):
+    if not user_text:
+        await m.answer("لم أستلم نصاً لتحويله إلى صوت.")
+        return
+
+    # ندمج برومبت الهوية + برومبت النموذج + نص المستخدم كنص واحد
+    prompt_parts = []
+    if client.brand_prompt:
+        prompt_parts.append(f"تعليمات الهوية:\n{client.brand_prompt}")
+    if t.base_prompt:
+        prompt_parts.append(f"تعليمات النموذج:\n{t.base_prompt}")
+    prompt_parts.append(f"النص المطلوب تحويله إلى صوت:\n{user_text}")
+
+    full_prompt = "\n\n".join(prompt_parts)
+
+    msg = await m.answer("🎧 جاري توليد الصوت...")
+    try:
+        audio_bytes = await audio_generate(model_id, full_prompt)
+        await msg.delete()
+
+        audio_input = BufferedInputFile(audio_bytes, filename="client_audio.mp3")
+        await m.bot.send_audio(m.chat.id, audio_input)
+    except Exception as e:
+        await msg.delete()
+        await m.answer(f"فشل توليد الصوت:\n{e}")
+
+
+async def _handle_video_generate(
+    m: Message,
+    client: Client,
+    t: Template,
+    model_id: str,
+    user_text: str,
+):
+    if not user_text:
+        await m.answer("لم أستلم وصفاً للفيديو المطلوب.")
+        return
+
+    prompt_parts = []
+    if client.brand_prompt:
+        prompt_parts.append(f"تعليمات الهوية:\n{client.brand_prompt}")
+    if t.base_prompt:
+        prompt_parts.append(f"تعليمات النموذج:\n{t.base_prompt}")
+    prompt_parts.append(f"وصف الفيديو المطلوب:\n{user_text}")
+
+    full_prompt = "\n\n".join(prompt_parts)
+
+    msg = await m.answer("🎥 جاري توليد الفيديو...\nقد يستغرق هذا بعض الوقت.")
+    try:
+        video_bytes = await video_generate(model_id, full_prompt)
+        await msg.delete()
+
+        video_input = BufferedInputFile(video_bytes, filename="client_video.mp4")
+        await m.bot.send_video(m.chat.id, video_input)
+    except Exception as e:
+        await msg.delete()
+        await m.answer(f"فشل توليد الفيديو:\n{e}")
