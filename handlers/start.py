@@ -3,8 +3,8 @@ from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
-from app.permissions import get_or_create_user
 from app.keyboards import main_menu
+from app.permissions import get_or_create_user
 
 router = Router()
 
@@ -24,6 +24,9 @@ async def cmd_start(m: Message):
         return
 
     await m.answer(
-        "مرحباً، اختر من القائمة:",
-        reply_markup=main_menu(is_owner=(user.role == "owner")),
+        "اختر من القائمة:",
+        reply_markup=main_menu(
+            is_owner=(user.role == "owner"),
+            has_free=(user.can_sandbox or user.role == "owner"),
+        ),
     )
