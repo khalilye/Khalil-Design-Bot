@@ -289,3 +289,20 @@ IMPORTANT:
         errors.append(f"attempt2(edit fallback): {e}")
 
     raise RuntimeError("فشل تعديل الصورة عبر OpenRouter:\n" + "\n---\n".join(errors))
+
+async def fetch_available_models() -> list[dict]:
+    """
+    يستعلم قائمة الموديلات من OpenRouter ويعيدها كقائمة dicts.
+    لا نقوم بأي تحويل، فقط نرجع data كما هي (غالباً في المفتاح 'data').
+    """
+    _require_key()
+    url = f"{OPENROUTER_BASE_URL}/models"
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(url, headers=HEADERS)
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code} {url}\n{_short(r.text)}")
+        js = r.json()
+        data = js.get("data") if isinstance(js, dict) else js
+        if not isinstance(data, list):
+            return []
+        return data
