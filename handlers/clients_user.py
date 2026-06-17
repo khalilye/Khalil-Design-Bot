@@ -481,6 +481,7 @@ async def _handle_image_generate(
     user_text: str,
     input_images: list[bytes],
 ):
+    # تركيب البرومبت النهائي
     prompt_parts = []
 
     if client.brand_prompt:
@@ -497,23 +498,34 @@ async def _handle_image_generate(
 
     msg = await m.answer("🖼️ جاري توليد الصورة...")
     try:
-        img_bytes = await image_generate(
+        # الصورة الأصلية كما رجعت من الموديل (بدون كليشة)
+        base_img_bytes = await image_generate(
             model=model_id,
             prompt=full_prompt,
             size=size,
             input_images=input_images or None,
         )
 
+        # صورة للعرض بعد تركيب الكليشة (إن وجدت)
+        final_img_bytes = base_img_bytes
         if client.overlay_path:
-            img_bytes = apply_overlay_png(img_bytes, client.overlay_path)
+            final_img_bytes = apply_overlay_png(base_img_bytes, client.overlay_path)
 
         await msg.delete()
 
-        photo_input = BufferedInputFile(img_bytes, filename="result.png")
-        doc_input = BufferedInputFile(img_bytes, filename="result.png")
-
+        # 1) إرسال الصورة (Photo) بالكليشة
+        photo_input = BufferedInputFile(final_img_bytes, filename="result.png")
         await m.bot.send_photo(m.chat.id, photo_input)
-        await m.bot.send_document(m.chat.id, doc_input)
+
+        # 2) مستند بالصورة النهائية (مع الكليشة)
+        doc_with_overlay = BufferedInputFile(final_img_bytes, filename="result_with_overlay.png")
+        await m.bot.send_document(m.chat.id, doc_with_overlay)
+
+        # 3) مستند إضافي بالصورة الأصلية من الموديل (بدون كليشة)
+        if client.overlay_path:
+            doc_original = BufferedInputFile(base_img_bytes, filename="result_original_no_overlay.png")
+            await m.bot.send_document(m.chat.id, doc_original)
+
     except Exception as e:
         await msg.delete()
         await m.answer(f"فشل توليد الصورة:\n{e}")
