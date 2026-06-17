@@ -23,26 +23,20 @@ class SectionEditState(StatesGroup):
 # ============ مساعدات ============
 
 def _sections_kb(current_parent_id: int | None, sections: list[Section]):
-    """
-    قائمة الأقسام تحت parent_id معيّن (قد يكون None للجذر).
-    """
     kb = InlineKeyboardBuilder()
 
-    # زر إضافة قسم جديد تحت هذا الـ parent
     parent_id_str = "none" if current_parent_id is None else str(current_parent_id)
     kb.button(
         text="➕ إضافة قسم جديد",
         callback_data=f"admin_section_add:{parent_id_str}",
     )
 
-    # عرض الأقسام الفرعية
     for sec in sections:
         kb.button(
             text=f"📁 {sec.name}",
             callback_data=f"admin_section_open:{sec.id}",
         )
 
-    # أزرار الرجوع
     if current_parent_id is None:
         kb.button(text="⬅️ رجوع", callback_data="settings_menu")
     else:
@@ -58,9 +52,10 @@ def _sections_kb(current_parent_id: int | None, sections: list[Section]):
 def _section_manage_kb(sec: Section):
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ إعادة تسمية القسم", callback_data=f"admin_section_rename:{sec.id}")
+    kb.button(text="⬆️ تحريك لأعلى", callback_data=f"admin_section_move:{sec.id}:up")
+    kb.button(text="⬇️ تحريك لأسفل", callback_data=f"admin_section_move:{sec.id}:down")
     kb.button(text="🗑️ حذف القسم", callback_data=f"admin_section_delete:{sec.id}")
     kb.button(text="🧩 إدارة النماذج في هذا القسم", callback_data=f"admin_templates_menu:{sec.id}")
-    # زر لفتح القسم واستعراض الأقسام الفرعية تحته
     kb.button(text="📂 فتح هذا القسم", callback_data=f"admin_section_open:{sec.id}")
     kb.button(text="⬅️ رجوع للأقسام", callback_data="admin_sections_menu")
     kb.adjust(1)
@@ -68,9 +63,6 @@ def _section_manage_kb(sec: Section):
 
 
 async def _render_sections_root(c: CallbackQuery):
-    """
-    عرض الأقسام في الجذر (parent_id = NULL)
-    """
     async with SessionLocal() as s:
         res = await s.execute(
             select(Section)
@@ -109,7 +101,6 @@ async def _render_sections_for_parent(c: CallbackQuery, parent_id: int):
         sections = list(res.scalars().all())
 
     if not parent:
-        # في حال تم حذف الـ parent، نرجع للجذر
         await _render_sections_root(c)
         return
 
@@ -134,10 +125,6 @@ async def _render_sections_for_parent(c: CallbackQuery, parent_id: int):
 
 @router.callback_query(F.data == "admin_sections_menu")
 async def admin_sections_menu(c: CallbackQuery):
-    """
-    من زر "إدارة الأقسام والنماذج" في الإعدادات.
-    يبدأ من الجذر.
-    """
     user = await get_or_create_user(c.from_user.id)
     if not (user.role == "owner" or user.can_manage_settings):
         await c.answer("ليست لديك صلاحية لإدارة الأقسام.", show_alert=True)
@@ -148,9 +135,6 @@ async def admin_sections_menu(c: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_section_open:"))
 async def admin_section_open(c: CallbackQuery):
-    """
-    فتح قسم معيّن: نعرض خياراته (إعادة تسمية/حذف/إدارة النماذج/فتح الأقسام الفرعية).
-    """
     section_id = int(c.data.split(":")[1])
     async with SessionLocal() as s:
         res = await s.execute(select(Section).where(Section.id == section_id))
@@ -172,9 +156,6 @@ async def admin_section_open(c: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_section_up:"))
 async def admin_section_up(c: CallbackQuery):
-    """
-    زر الرجوع للأعلى من داخل قسم فرعي.
-    """
     section_id = int(c.data.split(":")[1])
     async with SessionLocal() as s:
         res = await s.execute(select(Section).where(Section.id == section_id))
@@ -226,7 +207,6 @@ async def admin_section_add_name(m: Message, state: FSMContext):
         return
 
     async with SessionLocal() as s:
-        # نحسب sort_order بسيط: أكبر قيمة + 1
         if parent_id is None:
             res_order = await s.execute(
                 select(Section.sort_order).where(Section.parent_id.is_(None))
@@ -286,13 +266,61 @@ async def admin_section_rename_name(m: Message, state: FSMContext):
     await state.clear()
 
 
+# ============ تحريك ترتيب القسم ============
+
+@router.callback_query(F.data.startswith("admin_section_move:"))
+async def admin_section_move(c: CallbackQuery):
+    _, section_id_s, direction = c.data.split(":")
+    section_id = int(section_id_s)
+
+    async with SessionLocal() as s:
+        res = await s.execute(select(Section).where(Section.id == section_id))
+        sec = res.scalar_one_or_none()
+        if not sec:
+            await c.answer("القسم غير موجود.", show_alert=True)
+            return
+
+        parent_id = sec.parent_id
+
+        if direction == "up":
+            res2 = await s.execute(
+                select(Section)
+                .where(
+                    (Section.parent_id == parent_id),
+                    (Section.sort_order < sec.sort_order),
+                )
+                .order_by(Section.sort_order.desc())
+                .limit(1)
+            )
+        else:
+            res2 = await s.execute(
+                select(Section)
+                .where(
+                    (Section.parent_id == parent_id),
+                    (Section.sort_order > sec.sort_order),
+                )
+                .order_by(Section.sort_order.asc())
+                .limit(1)
+            )
+
+        neighbor = res2.scalar_one_or_none()
+        if not neighbor:
+            await c.answer("لا يمكن التحريك أكثر في هذا الاتجاه.", show_alert=True)
+            return
+
+        sec.sort_order, neighbor.sort_order = neighbor.sort_order, sec.sort_order
+        await s.commit()
+
+    await c.answer("تم تحديث ترتيب القسم.")
+    await admin_section_open(c)
+
+
 # ============ حذف قسم ============
 
 @router.callback_query(F.data.startswith("admin_section_delete:"))
 async def admin_section_delete(c: CallbackQuery):
     section_id = int(c.data.split(":")[1])
 
-    # تأكيد بسيط
     kb = InlineKeyboardBuilder()
     kb.button(
         text="✅ نعم، احذف",
@@ -318,7 +346,6 @@ async def admin_section_delete_confirm(c: CallbackQuery):
         await admin_sections_menu(c)
         return
 
-    # نحذف كل templates التابعة لهذا القسم، ثم القسم نفسه
     async with SessionLocal() as s:
         res = await s.execute(select(Section).where(Section.id == section_id))
         sec = res.scalar_one_or_none()
@@ -328,7 +355,6 @@ async def admin_section_delete_confirm(c: CallbackQuery):
 
         parent_id = sec.parent_id
 
-        # حذف النماذج التابعة
         res_t = await s.execute(select(Template).where(Template.section_id == section_id))
         templates = res_t.scalars().all()
         for t in templates:
@@ -338,7 +364,6 @@ async def admin_section_delete_confirm(c: CallbackQuery):
         await s.commit()
 
     await c.answer("تم حذف القسم.")
-    # نعيد عرض القائمة للأب
     if parent_id is None:
         await admin_sections_menu(c)
     else:
