@@ -1,5 +1,6 @@
 # handlers/free_mode.py
 from __future__ import annotations
+import re
 
 from io import BytesIO
 from typing import Optional
@@ -159,14 +160,20 @@ async def free_image_gen_input(m: Message, state: FSMContext):
         return
 
     prompt = user_text or "أنشئ صورة إبداعية مناسبة للوصف السابق (إن وجد)."
-    size = "1080x1080"
+
+    # استخراج مقاس من الوصف إن وجد (مثل 1080x1350)
+    size: Optional[str] = None
+    m_size = re.search(r"(\d+)\s*[x×]\s*(\d+)", prompt)
+    if m_size:
+        w, h = m_size.group(1), m_size.group(2)
+        size = f"{w}x{h}"
 
     msg = await m.answer("🖼️ جاري توليد الصورة...")
     try:
         img_bytes = await image_generate(
             model=model_id,
             prompt=prompt,
-            size=size,
+            size=size,  # None لو لم يُذكر مقاس
             input_images=input_images or None,
         )
 
