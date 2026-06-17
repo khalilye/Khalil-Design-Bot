@@ -50,7 +50,9 @@ OPERATION_KIND = {
 
 async def _get_accessible_clients(user: User) -> list[Client]:
     async with SessionLocal() as s:
-        res = await s.execute(select(Client).order_by(Client.sort_order.asc(), Client.name.asc()))
+        res = await s.execute(
+            select(Client).order_by(Client.sort_order.asc(), Client.name.asc())
+        )
         clients = list(res.scalars().all())
     return clients
 
@@ -117,10 +119,14 @@ async def _resolve_model(
     t: Template,
     client: Client,
 ) -> tuple[Optional[str], Optional[str]]:
+    """
+    اختيار الموديل بناءً على نوع العملية والنموذج فقط.
+    لا نعتمد على موديلات افتراضية داخل العميل.
+    """
     op = t.operation
     kind = OPERATION_KIND.get(op)
 
-    # اختيار موديل افتراضي حسب النوع (بدون اعتماد على العميل)
+    # افتراض عام حسب النوع
     if kind == "text":
         model_id: Optional[str] = DEFAULT_TEXT_MODEL
     elif kind == "image":
@@ -130,7 +136,7 @@ async def _resolve_model(
     else:
         model_id = None
 
-    # نحاول override من ModelCatalog
+    # override من ModelCatalog إن وجد
     async with SessionLocal() as s:
         res = await s.execute(
             select(ModelCatalog).where(ModelCatalog.id == t.model_catalog_id)
@@ -270,34 +276,44 @@ async def user_template_pick(c: CallbackQuery, state: FSMContext):
     await state.update_data(client_id=client_id, template_id=template_id, multi_images=[])
     await state.set_state(ClientGenState.waiting_input)
 
+    op = t.operation
     fr = t.file_requirement
 
-    if fr == "none":
-        msg = (
-            f"النموذج: {t.name}\n\n"
-            "أرسل الآن نص الطلب (الوصف/المحتوى) ليتم التوليد بناءً عليه."
-        )
-    elif fr == "image_single":
-        msg = (
-            f"النموذج: {t.name}\n\n"
-            "أرسل الآن صورة واحدة مع كتابة التعليمات في الوصف (Caption)."
-        )
-    elif fr == "image_multi":
+    # حالة خاصة: image_multi (عدة صور) مع image_generate
+    if op == "image_generate" and fr == "image_multi":
         msg = (
             f"النموذج: {t.name}\n\n"
             "أرسل الصور واحدة تلو الأخرى (كصور أو ملفات صورة).\n"
             "بعد الانتهاء من إرسال كل الصور، أرسل رسالة أخيرة تحتوي فقط على التعليمات النصية (بدون صور)."
         )
-    elif fr == "video_single":
+    elif op == "image_edit":
         msg = (
             f"النموذج: {t.name}\n\n"
-            "أرسل الآن فيديو واحد مع التعليمات في الوصف.\n"
-            "تنبيه: عمليات الفيديو لم تُنفّذ بعد في البوت، سيتم إبلاغك بذلك."
+            "أرسل صورة واحدة مع كتابة ما تريد تعديله في الوصف (Caption).\n"
+            "لن نستخدم برومبت الهوية أو الكليشة في التعديل."
+        )
+    elif op == "image_generate":
+        msg = (
+            f"النموذج: {t.name}\n\n"
+            "أرسل وصفاً للصورة التي تريدها.\n"
+            "يمكنك أيضاً إرفاق صورة واحدة كمرجع (اختياري)."
+        )
+    elif op == "text_generate":
+        msg = (
+            f"النموذج: {t.name}\n\n"
+            "أرسل النص المطلوب.\n"
+            "حالياً لا يتم استخدام الصور في توليد النص في هذا الإصدار."
+        )
+    elif op in ("video_generate", "video_edit", "audio_generate"):
+        msg = (
+            f"النموذج: {t.name}\n\n"
+            "هذه العملية مخصّصة للفيديو/الصوت.\n"
+            "الواجهة جاهزة، لكن التنفيذ الفعلي لهذه العمليات لم يُطبق بعد."
         )
     else:
         msg = (
             f"النموذج: {t.name}\n\n"
-            "أرسل الآن البيانات المطلوبة (نص / وسائط) حسب هذا النموذج."
+            "أرسل البيانات المطلوبة (نص/صور/فيديو) حسب إعدادات هذا النموذج."
         )
 
     await c.message.answer(msg)
@@ -338,8 +354,8 @@ async def user_template_input(m: Message, state: FSMContext):
     op = t.operation
     fr = t.file_requirement
 
-    # ========== حالة image_multi (جمع عدة صور ثم نص التعليمات) ==========
-    if fr == "image_multi":
+    # ===== حالة خاصة: image_multi =====
+    if op == "image_generate" and fr == "image_multi":
         state_data = await state.get_data()
         images: list[bytes] = state_data.get("multi_images", [])
 
@@ -360,7 +376,7 @@ async def user_template_input(m: Message, state: FSMContext):
             )
             return
 
-        # لا توجد صورة في هذه الرسالة → نفترض أنها رسالة التعليمات النهائية
+        # لا توجد صورة في الرسالة الحالية → نفترض أنها رسالة التعليمات النهائية
         user_text = (m.text or m.caption or "").strip()
         if not images:
             await m.answer(
@@ -380,48 +396,40 @@ async def user_template_input(m: Message, state: FSMContext):
         await state.clear()
         return
 
-    # ========== باقي حالات الملفات ==========
+    # ===== باقي الحالات (مرنة) =====
     user_text = (m.text or "") if m.text else (m.caption or "")
 
     input_images: list[bytes] = []
     input_video: Optional[bytes] = None
 
-    if fr == "image_single":
-        file_id = None
-        if m.photo:
-            file_id = m.photo[-1].file_id
-        elif m.document and (m.document.mime_type or "").startswith("image/"):
-            file_id = m.document.file_id
-
-        if not file_id:
-            await m.answer("هذا النموذج يحتاج صورة واحدة. الرجاء إرسال صورة مع الوصف.")
-            return
-
+    # نقرأ أي صورة/ملف صورة إن وُجد (اختياري)
+    if m.photo:
+        file_id = m.photo[-1].file_id
+        img_bytes = await _download_file_bytes(m, file_id)
+        input_images.append(img_bytes)
+    elif m.document and (m.document.mime_type or "").startswith("image/"):
+        file_id = m.document.file_id
         img_bytes = await _download_file_bytes(m, file_id)
         input_images.append(img_bytes)
 
-    elif fr == "video_single":
-        if m.video:
-            vid_id = m.video.file_id
-            input_video = await _download_file_bytes(m, vid_id)
-        else:
-            await m.answer("هذا النموذج يحتاج فيديو واحد. الرجاء إرسال فيديو مع الوصف.")
-            return
+    # نقرأ فيديو إن وُجد (اختياري)
+    if m.video:
+        vid_id = m.video.file_id
+        input_video = await _download_file_bytes(m, vid_id)
 
-    # ========== تنفيذ حسب نوع العملية ==========
+    # معالجة حسب نوع العملية
     try:
         if op == "text_generate":
             await _handle_text_generate(m, client, t, model_id, user_text)
         elif op == "image_generate":
             await _handle_image_generate(m, client, t, model_id, user_text, input_images)
         elif op == "image_edit":
-            # تعديل صورة: لا نستخدم برومبت الهوية ولا الكليشة
             base_img = input_images[0] if input_images else None
             await _handle_image_edit(m, t, model_id, user_text, base_img)
         elif op in ("video_generate", "video_edit", "audio_generate"):
             await m.answer(
                 f"النموذج مضبوط على عملية: {op}\n"
-                "واجهة هذه العملية جاهزة، لكن التنفيذ الفعلي لم يتم بعد في هذا الإصدار من البوت."
+                "الواجهة جاهزة، لكن التنفيذ الفعلي لهذه العملية لم يتم بعد في هذا الإصدار."
             )
         else:
             await m.answer(
@@ -519,7 +527,7 @@ async def _handle_image_edit(
     base_image_bytes: Optional[bytes],
 ):
     if not base_image_bytes:
-        await m.answer("هذا النموذج يحتاج صورة كأساس للتعديل. الرجاء إرسال صورة.")
+        await m.answer("هذا النموذج يحتاج صورة كأساس للتعديل. الرجاء إرسال صورة مع التعليمات في الوصف.")
         return
 
     prompt_parts = []
@@ -537,7 +545,7 @@ async def _handle_image_edit(
             image_bytes=base_image_bytes,
             prompt=full_prompt,
             strength=0.3,
-            size=None,  # نحافظ على مقاس الصورة الأصلية
+            size=None,  # نحافظ على مقاس الصورة الأصلي
         )
         await msg.delete()
 
