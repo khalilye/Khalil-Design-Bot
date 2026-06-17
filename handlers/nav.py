@@ -9,22 +9,24 @@ from app.keyboards import main_menu
 router = Router()
 
 
-async def _render_main_menu(c: CallbackQuery):
+@router.callback_query(F.data == "nav_home")
+async def nav_home(c: CallbackQuery, state: FSMContext):
     user = await get_or_create_user(c.from_user.id)
+    await state.clear()
     try:
         await c.message.edit_text(
             "القائمة الرئيسية:",
-            reply_markup=main_menu(is_owner=(user.role == "owner")),
+            reply_markup=main_menu(
+                is_owner=(user.role == "owner"),
+                has_free=(user.can_sandbox or user.role == "owner"),
+            ),
         )
     except Exception:
         await c.message.answer(
             "القائمة الرئيسية:",
-            reply_markup=main_menu(is_owner=(user.role == "owner")),
+            reply_markup=main_menu(
+                is_owner=(user.role == "owner"),
+                has_free=(user.can_sandbox or user.role == "owner"),
+            ),
         )
     await c.answer()
-
-
-@router.callback_query(F.data == "nav_home")
-async def nav_home(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _render_main_menu(c)
