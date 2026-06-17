@@ -1,7 +1,7 @@
 # handlers/free_mode.py
 from __future__ import annotations
-import re
 
+import re
 from io import BytesIO
 from typing import Optional
 
@@ -13,7 +13,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.permissions import get_or_create_user
 from app.config import DEFAULT_TEXT_MODEL, DEFAULT_IMAGE_MODEL
-from app.openrouter import chat, image_generate, image_edit
+from app.openrouter import chat, image_generate, image_edit, audio_generate, video_generate
+from app.model_store import list_models
 
 router = Router()
 
@@ -22,6 +23,8 @@ class FreeState(StatesGroup):
     waiting_text = State()
     waiting_image_generate = State()
     waiting_image_edit = State()
+    waiting_audio_generate = State()
+    waiting_video_generate = State()
 
 
 def _free_menu_kb():
@@ -29,9 +32,8 @@ def _free_menu_kb():
     kb.button(text="📝 توليد نص", callback_data="free_text_gen")
     kb.button(text="🖼️ توليد صورة", callback_data="free_image_gen")
     kb.button(text="✏️ تعديل صورة", callback_data="free_image_edit")
-    kb.button(text="🎥 توليد فيديو (غير مدعوم الآن)", callback_data="free_video_gen")
-    kb.button(text="✏️ تعديل فيديو (غير مدعوم الآن)", callback_data="free_video_edit")
-    kb.button(text="🎧 توليد صوت (غير مدعوم الآن)", callback_data="free_audio_gen")
+    kb.button(text="🎧 توليد صوت", callback_data="free_audio_gen")
+    kb.button(text="🎥 توليد فيديو", callback_data="free_video_gen")
     kb.button(text="🏠 الرئيسية", callback_data="nav_home")
     kb.adjust(1)
     return kb.as_markup()
@@ -51,6 +53,20 @@ def _get_user_text_model(user) -> str:
 
 def _get_user_image_model(user) -> str:
     return user.image_model or DEFAULT_IMAGE_MODEL
+
+
+async def _get_free_audio_model() -> Optional[str]:
+    rows = await list_models("audio", enabled_only=True)
+    if rows:
+        return rows[0].model_id
+    return None
+
+
+async def _get_free_video_model() -> Optional[str]:
+    rows = await list_models("video", enabled_only=True)
+    if rows:
+        return rows[0].model_id
+    return None
 
 
 # ============ منيو القسم الحر ============
@@ -128,7 +144,8 @@ async def free_image_gen(c: CallbackQuery, state: FSMContext):
     await c.message.answer(
         "🖼️ توليد صورة حر.\n"
         "أرسل وصفاً للصورة التي تريدها.\n"
-        "يمكنك أيضاً إرفاق صورة واحدة كمرجع (اختياري) مع كتابة الوصف في الـ Caption."
+        "يمكنك أيضاً إرفاق صورة واحدة كمرجع (اختياري) مع كتابة الوصف في الـ Caption.\n"
+        "لو كتبت مقاساً مثل 1080x1350 في الوصف، سيتم استخدامه."
     )
     await c.answer()
 
@@ -202,7 +219,8 @@ async def free_image_edit(c: CallbackQuery, state: FSMContext):
     await state.set_state(FreeState.waiting_image_edit)
     await c.message.answer(
         "✏️ تعديل صورة حر.\n"
-        "أرسل صورة واحدة مع كتابة ما تريد تعديله في الوصف (Caption)."
+        "أرسل صورة واحدة مع كتابة ما تريد تعديله في الوصف (Caption).\n"
+        "لن يتم تغيير المقاس إلا إذا طلبت ذلك صراحة في الوصف."
     )
     await c.answer()
 
@@ -240,7 +258,7 @@ async def free_image_edit_input(m: Message, state: FSMContext):
             image_bytes=base_img,
             prompt=user_text,
             strength=0.3,
-            size=None,
+            size=None,  # لن نرسل مقاس → لا تغيّر الدقة
         )
         await msg.delete()
 
@@ -255,17 +273,100 @@ async def free_image_edit_input(m: Message, state: FSMContext):
     await state.clear()
 
 
-# ============ 4) واجهة الفيديو والصوت (غير مدعومة فعلياً حتى الآن) ============
+# ============ 4) توليد الصوت ============
 
-@router.callback_query(F.data.in_({"free_video_gen", "free_video_edit", "free_audio_gen"}))
-async def free_not_supported(c: CallbackQuery):
-    op = c.data
-    if op == "free_video_gen":
-        msg = "🎥 توليد الفيديو غير مفعّل بعد في هذا الإصدار من البوت."
-    elif op == "free_video_edit":
-        msg = "✏️ تعديل الفيديو غير مفعّل بعد في هذا الإصدار من البوت."
-    else:
-        msg = "🎧 توليد الصوت غير مفعّل بعد في هذا الإصدار من البوت."
+@router.callback_query(F.data == "free_audio_gen")
+async def free_audio_gen(c: CallbackQuery, state: FSMContext):
+    user = await get_or_create_user(c.from_user.id)
+    if not (user.can_sandbox or user.role == "owner"):
+        await c.answer("ليست لديك صلاحية استخدام هذا القسم.", show_alert=True)
+        return
 
-    await c.message.answer(msg)
+    await state.set_state(FreeState.waiting_audio_generate)
+    await c.message.answer(
+        "🎧 توليد صوت حر.\n"
+        "أرسل النص الذي تريد تحويله إلى ملف صوتي.\n"
+        "تأكد أنك اخترت موديل صوت مناسب في '🧠 إدارة الموديلات' نوع audio، وفعّل واحداً منها."
+    )
     await c.answer()
+
+
+@router.message(FreeState.waiting_audio_generate)
+async def free_audio_gen_input(m: Message, state: FSMContext):
+    user = await get_or_create_user(m.from_user.id)
+
+    text = (m.text or m.caption or "").strip()
+    if not text:
+        await m.answer("يرجى إرسال نص لتحويله إلى صوت.")
+        return
+
+    model_id = await _get_free_audio_model()
+    if not model_id:
+        await m.answer(
+            "لا يوجد موديل صوت (audio) مفعّل حالياً.\n"
+            "أضف موديل صوت في '🧠 إدارة الموديلات' بنوع audio وفعّله."
+        )
+        await state.clear()
+        return
+
+    msg = await m.answer("🎧 جاري توليد الصوت...")
+    try:
+        audio_bytes = await audio_generate(model_id, text)
+        await msg.delete()
+
+        audio_input = BufferedInputFile(audio_bytes, filename="free_audio.mp3")
+        await m.bot.send_audio(m.chat.id, audio_input)
+    except Exception as e:
+        await msg.delete()
+        await m.answer(f"فشل توليد الصوت:\n{e}")
+    await state.clear()
+
+
+# ============ 5) توليد الفيديو ============
+
+@router.callback_query(F.data == "free_video_gen")
+async def free_video_gen(c: CallbackQuery, state: FSMContext):
+    user = await get_or_create_user(c.from_user.id)
+    if not (user.can_sandbox or user.role == "owner"):
+        await c.answer("ليست لديك صلاحية استخدام هذا القسم.", show_alert=True)
+        return
+
+    await state.set_state(FreeState.waiting_video_generate)
+    await c.message.answer(
+        "🎥 توليد فيديو حر.\n"
+        "أرسل وصفاً للفيديو القصير الذي تريد إنتاجه.\n"
+        "تأكد أنك اخترت موديل فيديو مناسب في '🧠 إدارة الموديلات' بنوع video، وفعّلت واحداً منها.\n"
+        "تنبيه: توليد الفيديو قد يستغرق وقتاً أطول، وقد يكون حجم الملف كبيراً."
+    )
+    await c.answer()
+
+
+@router.message(FreeState.waiting_video_generate)
+async def free_video_gen_input(m: Message, state: FSMContext):
+    user = await get_or_create_user(m.from_user.id)
+
+    text = (m.text or m.caption or "").strip()
+    if not text:
+        await m.answer("يرجى إرسال وصف للفيديو المطلوب.")
+        return
+
+    model_id = await _get_free_video_model()
+    if not model_id:
+        await m.answer(
+            "لا يوجد موديل فيديو (video) مفعّل حالياً.\n"
+            "أضف موديل فيديو في '🧠 إدارة الموديلات' بنوع video وفعّله."
+        )
+        await state.clear()
+        return
+
+    msg = await m.answer("🎥 جاري توليد الفيديو...\nقد يستغرق هذا بعض الوقت.")
+    try:
+        video_bytes = await video_generate(model_id, text)
+        await msg.delete()
+
+        video_input = BufferedInputFile(video_bytes, filename="free_video.mp4")
+        await m.bot.send_video(m.chat.id, video_input)
+    except Exception as e:
+        await msg.delete()
+        await m.answer(f"فشل توليد الفيديو:\n{e}")
+    await state.clear()
