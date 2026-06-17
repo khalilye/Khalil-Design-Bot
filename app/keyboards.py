@@ -2,12 +2,17 @@
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-def main_menu(is_owner: bool):
+def main_menu(is_owner: bool, has_free: bool):
     kb = InlineKeyboardBuilder()
-    kb.button(text="👥 العملاء", callback_data="clients_menu")          # سنبنيها لاحقاً
-    kb.button(text="📂 الأقسام الديناميكية", callback_data="sections_user_root")  # لاحقاً
-    kb.button(text="🎲 القسم الحر", callback_data="free_menu")         # لاحقاً
 
+    # قسم العملاء
+    kb.button(text="👥 العملاء", callback_data="clients_menu")
+
+    # القسم الحر (الاستخدام) - يظهر فقط إذا كان للمستخدم صلاحية sandbox
+    if has_free:
+        kb.button(text="🎲 القسم الحر", callback_data="free_menu")
+
+    # لوحة الإدارة
     if is_owner:
         kb.button(text="⚙️ الإعدادات (إدارة)", callback_data="settings_menu")
 
