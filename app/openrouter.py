@@ -66,6 +66,7 @@ def _extract_image_pointer_from_chat(js: dict) -> str | None:
 
     msg = choice0.get("message") or {}
 
+    # 1) message.images
     imgs = msg.get("images") or []
     if isinstance(imgs, list) and imgs:
         for it in imgs:
@@ -74,6 +75,7 @@ def _extract_image_pointer_from_chat(js: dict) -> str | None:
             if url:
                 return url
 
+    # 2) choice.images
     imgs2 = choice0.get("images") or []
     if isinstance(imgs2, list) and imgs2:
         for it in imgs2:
@@ -82,6 +84,7 @@ def _extract_image_pointer_from_chat(js: dict) -> str | None:
             if url:
                 return url
 
+    # 3) message.content parts
     content = msg.get("content")
     if isinstance(content, list):
         for part in content:
@@ -93,6 +96,7 @@ def _extract_image_pointer_from_chat(js: dict) -> str | None:
             if "b64_json" in part and part["b64_json"]:
                 return "data:image/png;base64," + part["b64_json"]
 
+    # 4) message.content string
     if isinstance(content, str):
         c = content.strip()
         if c.startswith("data:image"):
@@ -111,7 +115,10 @@ async def _pointer_to_bytes(pointer: str) -> bytes:
 
 def _size_instruction(size: Optional[str]) -> str:
     if not size:
-        return "Output exactly ONE image. If you return text, include ONLY the direct image URL or a data:image base64."
+        return (
+            "Output exactly ONE image. If you return text, include ONLY the direct image URL "
+            "or a data:image base64."
+        )
     return (
         f"Output exactly ONE image with resolution {size} (width x height). "
         "If exact size is not possible, keep the same aspect ratio and close resolution. "
@@ -153,6 +160,7 @@ IMPORTANT:
 
     errors = []
 
+    # محاولة 1: chat (نص + صور كأجزاء content)
     try:
         if input_images:
             parts = [{"type": "text", "text": base_instruction}]
@@ -177,6 +185,7 @@ IMPORTANT:
     except Exception as e:
         errors.append(f"attempt1(chat): {e}")
 
+    # محاولة 2: chat parts بدون صور
     try:
         payload = {
             "model": model,
@@ -190,6 +199,7 @@ IMPORTANT:
     except Exception as e:
         errors.append(f"attempt2(chat parts): {e}")
 
+    # محاولة 3: /completions (كـ fallback)
     if not input_images:
         try:
             payload = {
@@ -204,7 +214,9 @@ IMPORTANT:
                 return await _pointer_to_bytes(pointer)
 
             text = (js.get("choices") or [{}])[0].get("text", "")
-            pointer = _extract_url_from_text(text) or (text.strip() if text.strip().startswith("data:image") else None)
+            pointer = _extract_url_from_text(text) or (
+                text.strip() if text.strip().startswith("data:image") else None
+            )
             if not pointer:
                 raise RuntimeError(f"No image url in completions response: {str(js)[:900]}")
             return await _pointer_to_bytes(pointer)
@@ -212,3 +224,68 @@ IMPORTANT:
             errors.append(f"attempt3(completions): {e}")
 
     raise RuntimeError("فشل توليد الصورة عبر OpenRouter:\n" + "\n---\n".join(errors))
+
+
+async def image_edit(
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    strength: float = 0.3,
+    size: Optional[str] = None,
+) -> bytes:
+    """
+    تعديل صورة واحدة بناءً على تعليمات نصية.
+    - لا نضيف أي لوجو جديد.
+    - نحافظ قدر الإمكان على أسلوب الصورة ومقاسها (إلا إذا طلبت size).
+    """
+    data_url = _to_data_url(image_bytes)
+
+    instruction = f"""{prompt}
+
+IMPORTANT:
+- Keep original layout/style as much as possible.
+- Apply only requested changes.
+- strength_hint: {strength}
+- {_size_instruction(size) if size else "Keep image size/aspect ratio similar to original."}
+"""
+
+    errors = []
+
+    # محاولة 1: multimodal parts (نص + صورة)
+    try:
+        payload = {
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+        }
+        js = await _post_json("/chat/completions", payload, timeout=180)
+        pointer = _extract_image_pointer_from_chat(js)
+        if not pointer:
+            raise RuntimeError(f"No image in response: {str(js)[:900]}")
+        return await _pointer_to_bytes(pointer)
+    except Exception as e:
+        errors.append(f"attempt1(edit multimodal): {e}")
+
+    # محاولة 2: رسالتين (fallback)
+    try:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": instruction},
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url}}]},
+            ],
+        }
+        js = await _post_json("/chat/completions", payload, timeout=180)
+        pointer = _extract_image_pointer_from_chat(js)
+        if not pointer:
+            raise RuntimeError(f"No image in response: {str(js)[:900]}")
+        return await _pointer_to_bytes(pointer)
+    except Exception as e:
+        errors.append(f"attempt2(edit fallback): {e}")
+
+    raise RuntimeError("فشل تعديل الصورة عبر OpenRouter:\n" + "\n---\n".join(errors))
