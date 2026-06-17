@@ -236,17 +236,22 @@ async def image_edit(
     """
     تعديل صورة واحدة بناءً على تعليمات نصية.
     - لا نضيف أي لوجو جديد.
-    - نحافظ قدر الإمكان على أسلوب الصورة ومقاسها (إلا إذا طلبت size).
+    - لا نغيّر المقاس إلا إذا تم تمرير size بشكل صريح.
     """
     data_url = _to_data_url(image_bytes)
+
+    if size:
+        size_line = _size_instruction(size)
+    else:
+        size_line = "Do NOT change the image resolution or aspect ratio."
 
     instruction = f"""{prompt}
 
 IMPORTANT:
-- Keep original layout/style as much as possible.
-- Apply only requested changes.
+- Keep original layout and overall style as much as possible.
+- Apply only the requested changes.
 - strength_hint: {strength}
-- {_size_instruction(size) if size else "Keep image size/aspect ratio similar to original."}
+- {size_line}
 """
 
     errors = []
