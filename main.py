@@ -16,6 +16,7 @@ from handlers.clients_user import router as clients_user_router
 from handlers.admin_clients import router as admin_clients_router
 from handlers.admin_sections import router as admin_sections_router
 from handlers.admin_templates import router as admin_templates_router
+from handlers.free_mode import router as free_mode_router
 
 from app.webserver import start_web_server
 
@@ -39,10 +40,13 @@ async def main():
     dp.include_router(admin_sections_router)
     dp.include_router(admin_templates_router)
 
-    # قسم العملاء (واجهة المستخدم - حالياً Placeholder)
+    # واجهة العميل
     dp.include_router(clients_user_router)
 
-    # تشغيل البوت + الويب سيرفر الصغير
+    # القسم الحر
+    dp.include_router(free_mode_router)
+
+    # تشغيل البوت + الويب سيرفر
     bot_task = asyncio.create_task(dp.start_polling(bot))
     web_task = asyncio.create_task(start_web_server())
     await asyncio.gather(bot_task, web_task)
